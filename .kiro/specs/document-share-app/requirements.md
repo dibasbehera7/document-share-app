@@ -1,4 +1,4 @@
-# Requirements Document
+﻿# Requirements Document
 
 ## Introduction
 
@@ -20,7 +20,7 @@ The application must manage the full document lifecycle: upload → browse → c
 - **System**: The Document Share App application (frontend + backend services collectively).
 - **API_Service**: The backend REST API service that handles document metadata, auth token management, WOPI URL generation, webhook processing, and storage synchronisation.
 - **Auth_Service**: The authentication and authorisation component responsible for validating OIDC/OAuth2 tokens and enforcing per-document permissions.
-- **Webhook_Handler**: The backend component that receives and processes change notifications from SharePoint (Graph subscriptions or SPO REST webhooks) and triggers the debounce timer.
+- **Webhook_Handler**: The backend component that receives and processes change notifications from SharePoint (Graph subscriptions or SPO REST webhooks), processes `ItemCheckedIn` events to trigger immediate sync when Check-Out enforcement is enabled, and manages the Debounce_Timer for libraries without Check-Out enforcement.
 - **Sync_Service**: The backend component responsible for detecting editing-session completion and synchronising the latest document version from SharePoint to object storage.
 - **Storage_Adapter**: The abstraction layer over object storage (S3 / MinIO / Alibaba OSS) that provides versioned put, get, list, and delete operations.
 - **Metadata_Store**: The persistent store for document metadata and version records (DynamoDB in cloud; PostgreSQL or SQL Server in sovereign/on-prem).
@@ -29,8 +29,8 @@ The application must manage the full document lifecycle: upload → browse → c
 - **OWA / OOS**: Office Web Apps (cloud) or Office Online Server (on-premises) — the WOPI client that renders and saves Office documents in the browser.
 - **Graph_Subscription**: A Microsoft Graph change-notification subscription registered against a SharePoint drive or list, delivering webhook payloads to the Webhook_Handler.
 - **SPO_Webhook**: A SharePoint REST API list subscription delivering change notifications to the Webhook_Handler (used when Graph subscriptions are unavailable, e.g., on-prem).
-- **RER**: Remote Event Receiver — a WCF SOAP endpoint registered on SharePoint Server On-Premises that receives synchronous or asynchronous events such as `ItemCheckedIn`.
-- **Debounce_Timer**: A per-document inactivity timer (default 3 minutes) reset on every incoming webhook notification; when it fires without reset, editing is considered complete.
+- **RER**: Remote Event Receiver — a WCF SOAP endpoint registered on SharePoint Server On-Premises that receives synchronous or asynchronous events such as `ItemCheckedIn`. Note: `ItemCheckedIn` is also available as a native SPO webhook event on SharePoint Online (cloud), so RER is not required for check-in detection on SPO; RER is specific to SharePoint Server On-Premises.
+- **Debounce_Timer**: A per-document inactivity timer (default 3 minutes) reset on every incoming webhook notification; when it fires without reset, editing is considered complete. This is the fallback mechanism used when Check-Out enforcement is not enabled on the Document_Library. The preferred approach for SPO cloud is to enforce `ForceCheckout = true` on the library and subscribe to the `ItemCheckedIn` SPO webhook event, which provides a deterministic "editing done" signal without relying on a timer heuristic.
 - **Version**: An immutable, numbered snapshot of a document stored in object storage. Version numbers are monotonically increasing integers starting at 1.
 - **ETag**: The SharePoint-assigned entity tag for a driveItem or file, used to detect whether content has changed since the last sync.
 - **Sensitivity_Label**: A classification marker (e.g., Public, Internal, Confidential, Highly Confidential) attached to a document, sourced from Microsoft Purview or a custom label schema.
@@ -145,7 +145,7 @@ The application must manage the full document lifecycle: upload → browse → c
 2. WHILE a Graph_Subscription's expiry is within 48 hours of the current time, THE API_Service SHALL renew the subscription by sending a PATCH to `https://graph.microsoft.com/v1.0/subscriptions/{subscriptionId}` with a new `expirationDateTime` of 29 days from the renewal date.
 3. IF a Graph_Subscription renewal attempt fails, THEN THE API_Service SHALL retry the renewal up to 3 times with exponential back-off starting at 60 seconds (60s, 120s, 240s); IF all 3 retries are exhausted, THE API_Service SHALL register a new subscription, replace the old subscription record in the Metadata_Store with the new subscription ID and expiry, and record the re-registration event in the Audit_Log.
 4. WHERE the deployment target is SharePoint Server On-Premises, THE API_Service SHALL register an SPO_Webhook subscription on the Document_Library's list ID using the SharePoint REST API, setting the `expirationDateTime` to 179 days from registration, and renew it using the same 3-retry exponential back-off logic described in criterion 3.
-5. WHEN a validation handshake request arrives at the webhook endpoint (GET with `validationtoken` query parameter), THE Webhook_Handler SHALL respond within 5 seconds with HTTP 200, `Content-Type: text/plain`, and the body set to the exact value of the `validationtoken` parameter.
+5. WHEN a validation handshake request arrives at the webhook endpoint (GET with `validationtoken` query parameter), THE Webhook_Handler SHALL respond within 5 seconds (SPO REST webhooks) or 3 seconds (Graph change notifications) with HTTP 200, `Content-Type: text/plain`, and the body set to the exact value of the `validationtoken` parameter.
 6. WHEN an incoming webhook payload's `clientState` field matches the stored secret token for the subscription ID, THE Webhook_Handler SHALL process the notification and return HTTP 200.
 7. IF the `clientState` field in an incoming webhook payload does not match the stored secret token for the subscription ID, THEN THE Webhook_Handler SHALL return HTTP 200 without processing the payload and record the mismatch — including the subscription ID and received clientState hash — in the Audit_Log.
 8. WHEN a Graph_Subscription lifecycle notification indicates the subscription has been deleted externally, THE API_Service SHALL remove the subscription record from the Metadata_Store and register a new subscription for the affected library within 5 minutes; IF the re-registration also fails after 3 retries, THE API_Service SHALL record a `subscription-registration-failed` alert in the Audit_Log and emit an operational alert.
@@ -159,12 +159,13 @@ The application must manage the full document lifecycle: upload → browse → c
 #### Acceptance Criteria
 
 1. WHEN a webhook notification is received for a document, THE Webhook_Handler SHALL enqueue an async processing task and return HTTP 200 to the caller within 5 seconds.
-2. WHEN the async processing task runs, THE Webhook_Handler SHALL call the SharePoint Change Log API (`getchanges`) using the stored Change_Token as the start cursor, retrieve all change records since the last processed change, update the stored Change_Token with the latest token from the response, and reset the Debounce_Timer for each changed document ID to 3 minutes.
-3. WHEN the Debounce_Timer for a document fires without having been reset, THE Sync_Service SHALL be triggered to evaluate whether the document requires synchronisation to object storage.
+2. WHEN the async processing task runs, THE Webhook_Handler SHALL call the SharePoint Change Log API (`getchanges`) using the stored Change_Token as the start cursor, retrieve all change records since the last processed change, update the stored Change_Token with the latest token from the response, and reset the Debounce_Timer for each changed document ID to 3 minutes; IF the change records include an `ItemCheckedIn` event for a document in a library where Check-Out enforcement is enabled, THE Webhook_Handler SHALL additionally trigger the Sync_Service immediately for that document without waiting for the Debounce_Timer.
+3. WHEN the Debounce_Timer for a document fires without having been reset, THE Sync_Service SHALL be triggered to evaluate whether the document requires synchronisation to object storage. The Debounce_Timer is the primary sync-trigger mechanism for libraries where Check-Out enforcement is not enabled.
 4. WHILE a webhook notification for a given document was received within the preceding 30 seconds and another notification for the same document arrives, THE Webhook_Handler SHALL reset the Debounce_Timer without performing a Change Log API call, batching Change Log queries to at most once every 30 seconds per document.
-5. WHERE the deployment target is SharePoint Server On-Premises with Check-Out enforcement enabled, THE API_Service SHALL register an ItemCheckedIn Remote Event Receiver (RER) on the Document_Library.
-6. WHEN the RER fires for a document, THE Sync_Service SHALL be triggered within 60 seconds without waiting for a Debounce_Timer.
+5. WHERE Check-Out enforcement is enabled on the Document_Library (applies to both SPO cloud and SharePoint Server On-Premises), THE API_Service SHALL subscribe to `ItemCheckedIn` webhook events — via SPO REST webhook on cloud, or via an ItemCheckedIn Remote Event Receiver (RER) on SharePoint Server On-Premises.
+6. WHEN an `ItemCheckedIn` webhook event is received for a document (via SPO webhook on cloud, or RER on on-premises), THE Sync_Service SHALL be triggered within 60 seconds without waiting for a Debounce_Timer.
 7. IF the Change Log API call in criterion 2 fails, THEN THE Webhook_Handler SHALL retry the call up to 3 times with 30-second intervals; IF all retries are exhausted, THE Webhook_Handler SHALL record a `change-log-fetch-failed` event in the Audit_Log, preserve the existing Change_Token unchanged, and discard the current notification without triggering the Sync_Service.
+7a. WHERE Check-Out enforcement is NOT enabled on the Document_Library, THE Webhook_Handler SHALL use the Debounce_Timer as the primary mechanism for detecting editing-session completion; in this mode, the platform relies on the 3-minute inactivity heuristic rather than a deterministic check-in event.
 8. IF the Debounce_Timer fires and the Sync_Service determines that no item-update records exist for the document since the last Change_Token, THEN THE Sync_Service SHALL skip the synchronisation and record a `no-change` event in the Audit_Log.
 
 ---
@@ -274,7 +275,7 @@ The application must manage the full document lifecycle: upload → browse → c
 1. THE System SHALL determine all environment-specific configuration (identity provider URL, SharePoint tenant URL, object storage endpoint, metadata store connection, audit log destination) from environment variables; if an environment variable is absent, THE System SHALL fall back to a configuration file injected at deployment time; environment variables SHALL take precedence over configuration file values when both are present; no environment-specific values SHALL be hard-coded in application source.
 2. THE SharePoint_Adapter SHALL expose an abstraction that accepts driver configuration for: `graph-global` (Microsoft Graph global endpoint), `graph-china` (Microsoft Graph 21Vianet endpoint), and `sharepoint-rest-onprem` (SharePoint Server REST API with NTLM or form digest auth).
 3. THE Storage_Adapter SHALL expose an abstraction that accepts driver configuration for: `s3-aws` (AWS S3), `s3-minio` (MinIO self-hosted), and `s3-oss` (Alibaba Cloud OSS S3-compatible endpoint).
-4. THE Auth_Service SHALL accept driver configuration for: `entra-global` (Microsoft Entra ID global), `entra-china` (Microsoft Entra ID 21Vianet), `adfs` (on-prem ADFS OIDC), and `keycloak` (Keycloak OIDC).
+4. THE Auth_Service SHALL accept driver configuration for: `entra-global` (Microsoft Entra ID global), `entra-china` (Microsoft Entra ID 21Vianet), `adfs` (on-prem ADFS OIDC), and `keycloak` (Keycloak OIDC), and `dex` (Dex static password connector for local development).
 5. WHERE the deployment target is cloud-global, THE System SHALL use AWS DynamoDB as the Metadata_Store, AWS S3 as the Storage_Adapter, and Microsoft Entra ID as the Auth_Service.
 6. WHERE the deployment target is sovereign on-premises, THE System SHALL use PostgreSQL or SQL Server as the Metadata_Store, MinIO or Alibaba OSS as the Storage_Adapter, and Keycloak or ADFS as the Auth_Service.
 7. THE System SHALL expose a `/health` endpoint that returns HTTP 200 with a JSON body containing a `status` field (`ok` / `degraded` / `unavailable`) for each adapter (SharePoint_Adapter, Storage_Adapter, Metadata_Store, Auth_Service) and a top-level aggregate `status`; IF any adapter reports `unavailable`, the endpoint SHALL return HTTP 503.
@@ -284,19 +285,19 @@ The application must manage the full document lifecycle: upload → browse → c
 
 ### Requirement 15: Local Development Environment
 
-**User Story:** As a developer, I want to run the complete application locally using Docker Compose, so that I can develop and test features without requiring access to a live SharePoint tenant or cloud account.
+**User Story:** As a developer, I want to run the complete application locally using Docker Compose, so that I can develop and test features without requiring access to a live SharePoint tenant, cloud account, or Entra ID setup.
 
 #### Acceptance Criteria
 
-1. THE System SHALL provide a `docker-compose.yml` file in the repository root that starts all required services: API_Service, a MinIO instance (acting as the Storage_Adapter), a PostgreSQL instance (acting as the Metadata_Store), a Keycloak instance in development mode (acting as the OIDC provider), and a bundled WOPI stub server for local document editing.
+1. THE System SHALL provide a `docker-compose.yml` file in the repository root that starts all required services: API_Service, a MinIO instance (acting as the Storage_Adapter), a PostgreSQL instance (acting as the Metadata_Store), a Dex instance configured with the static password connector (acting as the OIDC provider), and a bundled WOPI stub server for local document editing.
 2. WHEN `docker compose up` is executed from the repository root, THE System SHALL start all services and the API_Service SHALL pass all health checks within 60 seconds.
 3. IF the `WOPI_MOCK` environment variable is set to `true`, THEN THE API_Service SHALL replace calls to SharePoint's `GetWopiFrameUrl` with a locally generated URL pointing to the bundled WOPI stub server.
-4. THE local development environment SHALL pre-seed the Metadata_Store with at least two sample documents and one sample user with `owner` permission so that developers can exercise the UI immediately after startup.
+4. THE local development environment SHALL pre-seed the Metadata_Store with at least two sample documents; the pre-seeded data SHALL include three named test users — `alice`, `bob`, and `charlie` — defined in both the Dex `staticPasswords` configuration and the Metadata_Store permission records, with `alice` holding `owner` permission, `bob` holding `edit` permission, and `charlie` holding `view` permission on the sample documents; this enables multi-user co-authoring scenarios to be exercised immediately after startup without any manual setup.
 5. THE local development environment SHALL mount the API_Service source directory into the container; WHEN a source file changes, THE API_Service SHALL reload within 10 seconds without requiring a container restart.
 6. WHEN running in local development mode, THE Audit_Log SHALL write structured JSON entries to stdout rather than to a WORM storage backend.
 7. THE System SHALL provide a `.env.example` file documenting all required and optional environment variables with descriptions, accepted values, and default values for local development.
-
----
+8. THE System SHALL provide a committed `dex-config.yaml` file in the repository root that configures the Dex OIDC provider with in-memory storage, a static client registration for the application, and static password entries for `alice`, `bob`, and `charlie` with a documented default password; the file SHALL contain no real credentials and SHALL be safe to commit to version control.
+9. THE System SHALL provide a `docs/local-dev-coauth-testing.md` guide documenting the three supported multi-user co-authoring test patterns: (a) manual browser-profile method — open two browser profiles or one normal window plus one incognito window, log in as different Dex users in each; (b) automated Playwright multi-context method — use isolated `BrowserContext` instances in a JUnit 5 test, each authenticated as a different Dex static user, to exercise simultaneous WOPI sessions; and (c) token injection method — mint JWTs for multiple users programmatically in a Spring Boot test and submit concurrent requests without a browser, suitable for testing the ETag idempotence property.
 
 ### Requirement 16: Infrastructure as Code — Cloud (AWS)
 
@@ -399,7 +400,7 @@ The application must manage the full document lifecycle: upload → browse → c
 
 1. THE API_Service SHALL return error responses in a consistent JSON schema containing at minimum: `error_code` (machine-readable string), `message` (human-readable description), `request_id` (UUID traceable in logs), and `timestamp`.
 2. THE API_Service SHALL emit structured JSON logs for every inbound request, including: request method, path, authenticated user ID, response status code, response time in milliseconds, and request ID.
-3. THE API_Service SHALL expose a Prometheus-compatible `/metrics` endpoint that responds within 200 ms and reports: request count by method and status code, request latency histogram by path, Sync_Service trigger count, sync success count, sync failure count, active Graph_Subscription count, and Debounce_Timer active count.
+3. THE API_Service SHALL expose a Prometheus-compatible `/metrics` endpoint that responds within 200 ms and reports: request count by method and status code, request latency histogram by path, Sync_Service trigger count, sync success count, sync failure count, active Graph_Subscription count, ItemCheckedIn trigger count, and Debounce_Timer active count.
 4. WHEN an unhandled exception occurs in any component, THE System SHALL log the full stack trace, request context, and affected document ID (if applicable) at `ERROR` level without including document content or user credentials in the log entry.
 5. THE System SHALL propagate a `X-Request-ID` header through all internal service calls, ensuring that a single user request generates log entries bearing the same request ID across all components.
 
@@ -418,3 +419,4 @@ The following requirements are best tested with integration tests using represen
 - **Requirement 5** (Co-authoring via WOPI): Co-authoring behaviour depends on SharePoint Server or a real WOPI host; 100 iterations add no value over 2–3 representative scenarios.
 - **Requirement 4** (Download): Download correctness is verifiable with 2–3 representative version numbers; streaming behaviour does not benefit from property-based testing.
 - **Requirement 20** (Data residency): Endpoint blocking is verified by unit tests on the SharePoint_Adapter guard logic plus 1–2 integration smoke tests confirming no calls reach global Microsoft endpoints.
+- **Requirement 7** (Change detection): Requirement 7 now has two distinct sync-trigger paths — the `ItemCheckedIn` immediate-trigger path (criteria 2 and 6) and the Debounce_Timer fallback path (criteria 3 and 7a). Each path SHALL be covered by at least one integration test using a representative scenario: one test exercising the check-in event → immediate sync flow, and one test exercising the debounce expiry → sync flow.

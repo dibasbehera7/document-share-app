@@ -262,6 +262,9 @@ TRIGGERS (fires webhook):          DOES NOT TRIGGER:
 ├── File deleted                   ├── Co-authoring session joined
 ├── Metadata updated               └── Co-authoring session left
 ├── File moved/renamed
+├── File checked out (ItemCheckedOut)
+├── File checked in (ItemCheckedIn)  ← KEY: deterministic edit-done signal
+├── Checkout discarded (ItemUncheckedOut)
 └── Permissions changed
 ```
 
@@ -426,31 +429,46 @@ DELETE https://graph.microsoft.com/v1.0/subscriptions/{subscriptionId}
 
 ### "Editing Stopped" Signal — Options Compared
 
-| Option | Accuracy | Complexity | Latency |
-|---|---|---|---|
-| Webhook + debounce (3 min no activity) | Medium | Low | ~3 min after last save |
-| Poll `CheckOut` lock status | High | Medium | Near real-time (poll interval) |
-| Check-In/Check-Out enforcement + RER | Highest | Medium | Immediate on check-in |
-| Graph socket.IO subscription | Medium | Medium | Near real-time |
+| Option | Accuracy | Complexity | Latency | Basis |
+|---|---|---|---|---|
+| SPO Webhook `ItemCheckedIn` (Check-Out enforced) | **Highest** | Low–Medium | Immediate on check-in | ✅ Official MS API event |
+| Check-In/Check-Out enforcement + RER (on-prem only) | **Highest** | Medium | Immediate on check-in | ✅ Official (on-prem) |
+| Poll `CheckOut` lock status via Graph | High | Medium | Near real-time (poll interval) | ✅ Official API |
+| Graph socket.IO subscription | Medium | Medium | Near real-time | ✅ Official API |
+| Webhook + debounce (3 min no activity) | Medium | Low | ~3 min after last save | ⚠ Community heuristic only |
 
-**Recommended for SPO:** Debounce pattern on Graph subscriptions:
+> **Clarification (verified Sept 2026):** The 3-minute debounce is a **community-derived heuristic**, not a Microsoft-documented pattern. It works because Office auto-save fires roughly every 30–60 seconds while editing — but it carries false-positive risk if a user pauses mid-edit. **Preferred approach for SPO cloud:** Enforce `ForceCheckout = true` on the library and subscribe to `ItemCheckedIn` webhooks. The ETag comparison remains the correctness guard before writing to S3.
+
+**Recommended for SPO (cloud):** Check-Out enforcement + `ItemCheckedIn` webhook:
 
 ```
-onChange notification received
+Library has ForceCheckout = true
     │
     ▼
-Reset 3-minute inactivity timer
-    │
-    ▼  (if no new notification within 3 minutes)
-Timer fires → "editing stopped" assumed
+User opens doc → SP auto Check-Out issued
     │
     ▼
-Fetch latest file from SPO → compare ETag/version
+User edits via Office Web App (WOPI)
     │
     ▼
-If newer than stored → sync to S3
+User saves and closes → SP issues Check-In
+    │
+    ▼
+SPO fires ItemCheckedIn webhook → POST /webhook/sharepoint
+    │
+    ▼
+Handler: GET /drives/{id}/items/{id}?$select=eTag
+    │
+Compare: stored_etag == current_etag?
+    ├→→ SAME  → skip (no content change)
+    └→→ DIFF  → download content from SPO
+                 │
+                 ▼
+           PUT s3://bucket/docs/{id}/v{n+1}/file.docx
+                 │
+                 ▼
+           UPDATE metadata (version++, etag, s3_key)
 ```
-
 **Recommended for On-Premises (China/KSA):** Enforce Check-In/Check-Out:
 
 ```powershell
@@ -469,8 +487,8 @@ ItemCheckedIn Remote Event Receiver (RER) then fires a deterministic, reliable "
 |---|---|---|
 | Registration | REST API call | Visual Studio / PowerShell on farm |
 | Transport | HTTPS POST (push) | WCF SOAP service |
-| Events | List-level change only | ItemAdded, ItemUpdated, ItemDeleted, ItemCheckedIn, etc. |
-| "Edit done" event | No native support | `ItemCheckedIn` (when Check-Out enforced) |
+| Events | ItemAdded, ItemUpdated, ItemDeleted, **ItemCheckedIn**, ItemCheckedOut, ItemUncheckedOut, ItemFileMoved, etc. | ItemAdded, ItemUpdated, ItemDeleted, ItemCheckedIn, etc. |
+| "Edit done" event | `ItemCheckedIn` **supported** ✅ (when Check-Out enforced) | `ItemCheckedIn` (when Check-Out enforced) |
 | Payload richness | Minimal | Full event properties |
 | Availability | SPO only | SP Server 2013/2016/2019/SE |
 
@@ -1304,8 +1322,9 @@ def sync_document_to_s3(doc_id: str):
 | Graph subscription max expiry (driveItem) | 30 days | Auto-renew required |
 | Graph subscription max expiry (list) | 30 days | |
 | Webhook delivery delay | 0–5 minutes | Not guaranteed real-time |
-| Webhook retry on failure | 5 attempts | Dropped after 5 failures |
-| Webhook validation response time | 5 seconds | Must echo validationtoken within 5s |
+| Webhook retry on failure (SPO REST) | 5 attempts at 5-min intervals | Dropped after 5 failures |
+| Webhook retry on failure (Graph) | Up to 4 hours (exponential backoff) | Endpoint throttled if >10% slow responses |
+| Webhook validation response time | 5 seconds (SPO REST) / 3 seconds (Graph) | Must echo validationtoken within window |
 | Small file upload (Graph) | 4 MB max | Use upload session above 4 MB |
 | Large file upload session | 250 GB max | |
 | Upload session validity | 24 hours | Must complete upload within 24h |
@@ -1390,4 +1409,4 @@ def sync_document_to_s3(doc_id: str):
 
 ---
 
-*Content was compiled and paraphrased for compliance with licensing restrictions. All referenced documentation is from official Microsoft Learn (learn.microsoft.com) sources.*
+

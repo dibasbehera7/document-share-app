@@ -1,10 +1,10 @@
-# Design Document: Document Share App
+﻿# Design Document: Document Share App
 
 ## Overview
 
 Document Share App is a full-stack document sharing and co-authoring platform that uses SharePoint (Online or On-Premises) as the collaborative editing surface and S3-compatible object storage as the versioned, durable system of record. The platform must operate across three deployment topologies without codebase forks: Cloud Global (AWS + SharePoint Online + Entra ID), Sovereign/On-Premises (SharePoint Server 2019/SE + MinIO or Alibaba OSS + Keycloak or ADFS), and Local Development (Docker Compose with stubs).
 
-The core document lifecycle is: upload → browse/search → co-author via WOPI → webhook notification → debounce → ETag-based sync to object storage → version history available for download.
+The core document lifecycle is: upload → browse/search → co-author via WOPI → webhook notification (ItemCheckedIn or debounce fallback) → ETag-based sync to object storage → version history available for download.
 
 ### Key Design Decisions
 
@@ -12,7 +12,7 @@ The core document lifecycle is: upload → browse/search → co-author via WOPI 
 
 **Driver pattern for all external adapters.** Every external integration (Auth, SharePoint, Storage, MetadataStore) is expressed as an interface with multiple driver implementations. Environment variables select the driver at startup. This enables a single deployment pipeline to target all topologies.
 
-**Debounce + ETag idempotence for sync.** Rather than trying to detect "editor closed" (which SharePoint does not expose natively), the platform uses a per-document debounce timer that resets on every webhook notification. When the timer fires without reset, the Sync_Service compares the current ETag against the stored ETag and only writes a new version if they differ.
+**ItemCheckedIn webhook + ETag idempotence for sync (debounce as fallback).** When the Document_Library has `ForceCheckout = true` enforced, the platform subscribes to the `ItemCheckedIn` SPO webhook event, which fires a deterministic "editing done" signal immediately when a user checks in. This is the preferred path for SPO cloud and SharePoint Server On-Premises. When Check-Out enforcement is not enabled (e.g., a library that allows direct save without checkout), the platform falls back to a per-document debounce timer that resets on every webhook notification. In both paths, the Sync_Service compares the current ETag against the stored ETag before writing — ensuring idempotent, content-driven version creation.
 
 **Append-only audit log as a first-class concern.** Audit log writes are blocking — if the write fails after retries, the triggering operation is aborted. This ensures the audit log is always consistent with the operations that were committed.
 
@@ -64,7 +64,7 @@ The core document lifecycle is: upload → browse/search → co-author via WOPI 
 |---|---|
 | **API_Service** | REST API endpoint routing, request validation, session middleware, WOPI URL generation, permission enforcement, confirmation token issuance |
 | **Auth_Service** | OIDC token validation, session lifecycle, silent refresh, multi-provider driver |
-| **Webhook_Handler** | Validation handshake, async notification processing, Change Log API calls, Debounce_Timer reset, clientState verification |
+| **Webhook_Handler** | Validation handshake, async notification processing, Change Log API calls, ItemCheckedIn event processing, direct sync trigger on check-in events, Debounce_Timer reset (fallback path), clientState verification |
 | **Sync_Service** | ETag comparison, SharePoint content streaming, Storage_Adapter write, Metadata_Store conditional update, version record creation |
 | **SharePoint_Adapter** | Unified interface over Graph API (global/China) and SharePoint REST API (on-prem); file CRUD, upload sessions, webhooks, WOPI URL, Change Log, permissions |
 | **Storage_Adapter** | Unified interface over AWS S3 / MinIO / Alibaba OSS; versioned put, get, list, presigned URL |
@@ -103,20 +103,54 @@ Clients → Nginx (LB) → App Servers (K8s / VMs) (API_Service)
 ```
 Docker Compose:
   api_service (hot-reload)
-  keycloak (dev mode, OIDC stub)
+  dex (static password connector — OIDC provider, no DB, no Entra ID required)
   minio (S3-compatible)
   postgres (metadata store)
   wopi_stub (mock WOPI server)
   sharepoint_mock (optional MSGraph mock for offline dev)
 ```
 
-### Webhook → Debounce → Sync Flow
+### Webhook → Sync Flow
+
+Two paths exist depending on whether the Document_Library has Check-Out enforcement enabled.
+
+#### Path A: Check-Out Enforced — ItemCheckedIn (Preferred)
 
 ```
-SPO / Graph webhook POST /webhook/graph
+SPO webhook POST /webhook/sharepoint (ItemCheckedIn event)
     │
     ▼
 Webhook_Handler: validate clientState, enqueue async task, return HTTP 200 < 5s
+    │
+    ▼ (async)
+Webhook_Handler: call Change Log API with stored Change_Token
+    ├── Identify ItemCheckedIn change record for the document
+    ├── Update Change_Token
+    └── Trigger Sync_Service immediately (no Debounce_Timer wait)
+    │
+    ▼
+Sync_Service: GET SharePoint item ETag + lastModified
+    ├── ETag == stored spo_etag → record no-change, done
+    └── ETag differs
+          │
+          ▼
+        Stream content from SharePoint
+        PUT to Storage_Adapter at docs/{doc_id}/v{n+1}/{filename}
+          │
+          ▼
+        Conditional write to Metadata_Store (condition: spo_etag == stored_etag)
+          ├── Win (first writer): increment version, update s3_key, spo_etag, last_synced_at
+          └── Lose (concurrent write): silently discard
+```
+
+#### Path B: Check-Out Not Enforced — Debounce Fallback
+
+```
+SPO / Graph webhook POST /webhook/graph (ItemUpdated event)
+    │
+    ▼
+Webhook_Handler: validate clientState, enqueue async task,
+                 return HTTP 200 < 3s (Graph) / 5s (SPO REST)
     │
     ▼ (async)
 Webhook_Handler: call Change Log API with stored Change_Token
@@ -146,258 +180,274 @@ Sync_Service: GET SharePoint item ETag + lastModified
 
 ### Auth_Service Interface
 
-```typescript
-interface AuthDriver {
-  // Validate an inbound Bearer token; returns parsed claims
-  validateToken(token: string): Promise<Claims>;
+`java
+public interface AuthDriver {
 
-  // Build OIDC authorisation redirect URL (PKCE)
-  buildAuthorizationUrl(state: string, codeVerifier: string): string;
+    /** Validate an inbound Bearer token; returns parsed claims. */
+    Claims validateToken(String token);
 
-  // Exchange authorisation code for tokens
-  exchangeCode(code: string, codeVerifier: string): Promise<TokenSet>;
+    /** Build OIDC authorisation redirect URL (PKCE). */
+    String buildAuthorizationUrl(String state, String codeVerifier);
 
-  // Silent token refresh
-  refreshTokens(refreshToken: string): Promise<TokenSet>;
+    /** Exchange authorisation code for tokens. */
+    TokenSet exchangeCode(String code, String codeVerifier);
 
-  // Revoke refresh token with IdP
-  revokeToken(refreshToken: string): Promise<void>;
+    /** Silent token refresh. */
+    TokenSet refreshTokens(String refreshToken);
+
+    /** Revoke refresh token with IdP. */
+    void revokeToken(String refreshToken);
 }
 
-// Driver implementations: EntraGlobalDriver, EntraChinaDriver, AdfsDriver, KeycloakDriver
-```
+// Driver implementations (selected via @ConditionalOnProperty("auth.driver")):
+//   EntraGlobalDriver  — cloud global
+//   EntraChinaDriver   — 21Vianet SPO
+//   AdfsDriver         — on-prem sovereign
+//   KeycloakDriver     — sovereign / on-prem
+//   DexDriver          — local development (static password connector, no DB)
+`
 
 ### SharePoint_Adapter Interface
 
-```typescript
-interface SharePointDriver {
-  // File operations
-  uploadSmall(libraryRef: LibraryRef, filename: string, content: Buffer): Promise<SPItem>;
-  createUploadSession(libraryRef: LibraryRef, filename: string): Promise<UploadSession>;
-  uploadChunk(session: UploadSession, chunk: Buffer, range: ByteRange): Promise<UploadProgress>;
-  getItem(itemRef: ItemRef): Promise<SPItem>;
-  downloadItem(itemRef: ItemRef): Promise<NodeJS.ReadableStream>;
-  deleteItem(itemRef: ItemRef): Promise<void>;
+`java
+public interface SharePointDriver {
 
-  // Metadata
-  getETag(itemRef: ItemRef): Promise<string>;
-  listChildren(folderRef: FolderRef, pageToken?: string): Promise<PagedResult<SPItem>>;
-  search(libraryRef: LibraryRef, query: string): Promise<SPItem[]>;
+    // File operations
+    SpItem uploadSmall(LibraryRef libraryRef, String filename, byte[] content);
+    UploadSession createUploadSession(LibraryRef libraryRef, String filename);
+    UploadProgress uploadChunk(UploadSession session, byte[] chunk, ByteRange range);
+    SpItem getItem(ItemRef itemRef);
+    InputStream downloadItem(ItemRef itemRef);
+    void deleteItem(ItemRef itemRef);
 
-  // WOPI
-  getWopiFrameUrl(itemRef: ItemRef, action: 'edit' | 'view'): Promise<string>;
+    // Metadata
+    String getETag(ItemRef itemRef);
+    PagedResult<SpItem> listChildren(FolderRef folderRef, String pageToken);
+    List<SpItem> search(LibraryRef libraryRef, String query);
 
-  // Webhooks / subscriptions
-  registerSubscription(libraryRef: LibraryRef, notificationUrl: string, clientState: string): Promise<Subscription>;
-  renewSubscription(subId: string, newExpiry: Date): Promise<Subscription>;
-  deleteSubscription(subId: string): Promise<void>;
-  getChanges(libraryRef: LibraryRef, changeToken: string): Promise<ChangeResult>;
+    // WOPI
+    String getWopiFrameUrl(ItemRef itemRef, WopiAction action);  // WopiAction: EDIT | VIEW
 
-  // Permissions
-  grantPermission(itemRef: ItemRef, email: string, role: 'read' | 'write'): Promise<void>;
-  revokePermission(itemRef: ItemRef, permissionId: string): Promise<void>;
-  listPermissions(itemRef: ItemRef): Promise<SPPermission[]>;
+    // Webhooks / subscriptions
+    Subscription registerSubscription(LibraryRef libraryRef, String notificationUrl, String clientState);
+    Subscription renewSubscription(String subId, Instant newExpiry);
+    void deleteSubscription(String subId);
+    ChangeResult getChanges(LibraryRef libraryRef, String changeToken);
+
+    // Permissions
+    void grantPermission(ItemRef itemRef, String email, SpRole role);  // SpRole: READ | WRITE
+    void revokePermission(ItemRef itemRef, String permissionId);
+    List<SpPermission> listPermissions(ItemRef itemRef);
 }
 
-// Driver implementations:
-//   GraphGlobalDriver  — graph.microsoft.com
-//   GraphChinaDriver   — microsoftgraph.chinacloudapi.cn
-//   SharePointRestOnPremDriver — SP Server REST API
-```
+// Driver implementations (via @ConditionalOnProperty("sharepoint.driver")):
+//   GraphGlobalDriver   — graph.microsoft.com
+//   GraphChinaDriver    — microsoftgraph.chinacloudapi.cn
+//   SharePointRestDriver — SP Server REST API (on-prem)
+`
 
 ### Storage_Adapter Interface
 
-```typescript
-interface StorageDriver {
-  // Write an immutable version object
-  putObject(key: string, stream: NodeJS.ReadableStream, metadata: ObjectMetadata): Promise<void>;
+`java
+public interface StorageDriver {
 
-  // Stream an object to the caller
-  getObject(key: string): Promise<NodeJS.ReadableStream>;
+    /** Write an immutable version object. */
+    void putObject(String key, InputStream stream, ObjectMetadata metadata);
 
-  // Check object exists
-  headObject(key: string): Promise<ObjectHead | null>;
+    /** Stream an object to the caller. */
+    InputStream getObject(String key);
 
-  // Paginated list under a prefix
-  listObjects(prefix: string, pageToken?: string): Promise<PagedResult<ObjectInfo>>;
+    /** Check object exists; returns null if not found. */
+    ObjectHead headObject(String key);
+
+    /** Paginated list under a prefix. */
+    PagedResult<ObjectInfo> listObjects(String prefix, String pageToken);
 }
 
 // Key format: docs/{doc_id}/v{version}/{filename}
 //             audit/{year}/{month}/{day}/{entry_id}.json
-// Driver implementations: S3AwsDriver, S3MinioDriver, S3OssDriver
-```
+// Driver implementations (via @ConditionalOnProperty("storage.driver")):
+//   S3AwsDriver, S3MinioDriver, S3OssDriver
+`
 
 ### Metadata_Store Interface
 
-```typescript
-interface MetadataDriver {
-  // Document records
-  createDocument(doc: DocumentRecord): Promise<void>;
-  getDocument(docId: string): Promise<DocumentRecord | null>;
-  updateDocument(docId: string, patch: Partial<DocumentRecord>, condition?: ConditionalWrite): Promise<void>;
-  listDocuments(filter: DocumentFilter, page: PageCursor): Promise<PagedResult<DocumentRecord>>;
+`java
+public interface MetadataDriver {
 
-  // Version records
-  createVersionRecord(record: VersionRecord): Promise<void>;
-  getVersionRecord(docId: string, version: number): Promise<VersionRecord | null>;
-  listVersionRecords(docId: string, page: PageCursor): Promise<PagedResult<VersionRecord>>;
+    // Document records
+    void createDocument(DocumentRecord doc);
+    Optional<DocumentRecord> getDocument(String docId);
+    void updateDocument(String docId, DocumentPatch patch, ConditionalWrite condition);
+    PagedResult<DocumentRecord> listDocuments(DocumentFilter filter, PageCursor page);
 
-  // Permission records
-  upsertPermission(perm: PermissionRecord): Promise<void>;
-  deletePermission(docId: string, userId: string): Promise<void>;
-  getPermission(docId: string, userId: string): Promise<PermissionRecord | null>;
-  listPermissions(docId: string): Promise<PermissionRecord[]>;
+    // Version records
+    void createVersionRecord(VersionRecord record);
+    Optional<VersionRecord> getVersionRecord(String docId, int version);
+    PagedResult<VersionRecord> listVersionRecords(String docId, PageCursor page);
 
-  // Subscription records
-  upsertSubscription(sub: SubscriptionRecord): Promise<void>;
-  deleteSubscription(subId: string): Promise<void>;
-  getSubscription(subId: string): Promise<SubscriptionRecord | null>;
-  listSubscriptionsExpiringBefore(cutoff: Date): Promise<SubscriptionRecord[]>;
+    // Permission records
+    void upsertPermission(PermissionRecord perm);
+    void deletePermission(String docId, String userId);
+    Optional<PermissionRecord> getPermission(String docId, String userId);
+    List<PermissionRecord> listPermissions(String docId);
 
-  // Debounce timers (DynamoDB TTL items; EventBridge targets on cloud)
-  setDebounceTimer(docId: string, firesAt: Date): Promise<void>;
-  clearDebounceTimer(docId: string): Promise<void>;
+    // Subscription records
+    void upsertSubscription(SubscriptionRecord sub);
+    void deleteSubscription(String subId);
+    Optional<SubscriptionRecord> getSubscription(String subId);
+    List<SubscriptionRecord> listSubscriptionsExpiringBefore(Instant cutoff);
 
-  // Audit log (append-only)
-  appendAuditEntry(entry: AuditEntry): Promise<void>;
+    // Debounce timers (DynamoDB TTL items on cloud; Redisson delayed queue on sovereign)
+    void setDebounceTimer(String docId, Instant firesAt);
+    void clearDebounceTimer(String docId);
+
+    // Audit log (append-only)
+    void appendAuditEntry(AuditEntry entry);
 }
 
-// Driver implementations: DynamoDbDriver, PostgresDriver, SqlServerDriver
-```
+// Driver implementations (via @ConditionalOnProperty("metadata.driver")):
+//   DynamoDbDriver, JpaPostgresDriver, JpaSqlServerDriver
+`
 
 ---
-
 ## Data Models
 
 ### DocumentRecord
 
-```typescript
-interface DocumentRecord {
-  doc_id: string;                 // UUID, primary key
-  filename: string;               // Original filename
-  file_size_bytes: number;
-  spo_item_id: string;            // SharePoint driveItem ID
-  spo_drive_id: string;
-  spo_site_id: string;
-  current_version: number;        // Monotonically increasing integer, starts at 1
-  s3_key: string;                 // Key for current version in object storage
-  spo_etag: string;               // ETag from SharePoint, used for sync idempotence
-  upload_timestamp: string;       // ISO 8601 UTC millisecond precision
-  uploader_user_id: string;
-  last_modified_at: string;       // ISO 8601 UTC
-  last_modified_by: string;
-  last_synced_at: string;         // ISO 8601 UTC
-  sensitivity_label: SensitivityLabel; // "Public" | "Internal" | "Confidential" | "Highly_Confidential"
-  highly_confidential_edit_override: boolean;
-  status: 'active' | 'deleted';
-  change_token: string;           // SharePoint Change Log cursor for this document's library
-  library_id: string;             // The Document_Library this document belongs to
-  created_at: string;             // ISO 8601 UTC
-}
+`java
+public record DocumentRecord(
+    String docId,                   // UUID, primary key
+    String filename,
+    long fileSizeBytes,
+    String spoItemId,               // SharePoint driveItem ID
+    String spoDriveId,
+    String spoSiteId,
+    int currentVersion,             // Monotonically increasing integer, starts at 1
+    String s3Key,                   // Key for current version in object storage
+    String spoEtag,                 // ETag from SharePoint, used for sync idempotence
+    Instant uploadTimestamp,        // UTC, millisecond precision
+    String uploaderUserId,
+    Instant lastModifiedAt,
+    String lastModifiedBy,
+    Instant lastSyncedAt,
+    SensitivityLabel sensitivityLabel,
+    boolean highlyConfidentialEditOverride,
+    DocumentStatus status,          // ACTIVE | DELETED
+    String changeToken,             // SharePoint Change Log cursor
+    String libraryId,
+    Instant createdAt
+) {}
 
-type SensitivityLabel = 'Public' | 'Internal' | 'Confidential' | 'Highly_Confidential';
-```
+public enum SensitivityLabel { PUBLIC, INTERNAL, CONFIDENTIAL, HIGHLY_CONFIDENTIAL }
+public enum DocumentStatus    { ACTIVE, DELETED }
+`
 
 ### VersionRecord
 
-```typescript
-interface VersionRecord {
-  doc_id: string;                 // Partition key
-  version_number: number;         // Sort key
-  s3_key: string;                 // Immutable object key in Storage_Adapter
-  filename: string;               // Filename at sync time (may differ from current if renamed)
-  file_size_bytes: number;
-  spo_etag: string;               // SharePoint ETag that triggered this version — UNIQUE per doc
-  sync_timestamp: string;         // ISO 8601 UTC when sync completed
-  synced_by_user_id: string;      // User who last modified in SharePoint (from Change Log)
-  sharepoint_version_label: string; // e.g. "3.0"
-}
-```
+`java
+public record VersionRecord(
+    String docId,                   // Partition key
+    int versionNumber,              // Sort key
+    String s3Key,                   // Immutable object key in Storage_Adapter
+    String filename,                // Filename at sync time
+    long fileSizeBytes,
+    String spoEtag,                 // SharePoint ETag that triggered this version — UNIQUE per doc
+    Instant syncTimestamp,
+    String syncedByUserId,
+    String sharepointVersionLabel   // e.g. "3.0"
+) {}
+`
 
 ### PermissionRecord
 
-```typescript
-interface PermissionRecord {
-  doc_id: string;
-  user_id: string;
-  user_email: string;
-  display_name: string;
-  permission_level: 'view' | 'edit' | 'owner';
-  spo_permission_id: string;      // Graph API permission ID for revocation
-  granted_at: string;             // ISO 8601 UTC
-  granted_by: string;
-}
-```
+`java
+public record PermissionRecord(
+    String docId,
+    String userId,
+    String userEmail,
+    String displayName,
+    PermissionLevel permissionLevel, // VIEW | EDIT | OWNER
+    String spoPermissionId,          // Graph API permission ID for revocation
+    Instant grantedAt,
+    String grantedBy
+) {}
+
+public enum PermissionLevel { VIEW, EDIT, OWNER }
+`
 
 ### SubscriptionRecord
 
-```typescript
-interface SubscriptionRecord {
-  subscription_id: string;        // Primary key (Graph or SPO webhook ID)
-  library_id: string;             // Document_Library this subscription covers
-  subscription_type: 'graph' | 'spo-rest';
-  notification_url: string;
-  client_state_hash: string;      // HMAC-SHA256 of the clientState secret (not the secret itself)
-  client_state_secret: string;    // Stored encrypted; used for validation
-  expiry: string;                 // ISO 8601 UTC
-  registered_at: string;
-  last_renewed_at: string;
-  site_id: string;
-  drive_id: string;
-}
-```
+`java
+public record SubscriptionRecord(
+    String subscriptionId,          // Primary key (Graph or SPO webhook ID)
+    String libraryId,
+    SubscriptionType subscriptionType, // GRAPH | SPO_REST
+    String notificationUrl,
+    String clientStateHash,         // HMAC-SHA256 of clientState secret (never stored raw)
+    String clientStateSecret,       // Stored encrypted (AES-256-GCM)
+    Instant expiry,
+    Instant registeredAt,
+    Instant lastRenewedAt,
+    String siteId,
+    String driveId
+) {}
+
+public enum SubscriptionType { GRAPH, SPO_REST }
+`
 
 ### AuditEntry
 
-```typescript
-interface AuditEntry {
-  entry_id: string;               // UUID
-  event_type: AuditEventType;
-  doc_id: string | null;          // null for system-level events
-  user_id: string;                // user identity or "system"
-  user_email: string | null;
-  timestamp: string;              // ISO 8601 UTC millisecond precision
-  client_ip: string | null;
-  outcome: 'success' | 'failure' | 'denied';
-  details: Record<string, unknown>; // Event-specific fields (old_label, new_label, version, etc.)
+`java
+public record AuditEntry(
+    String entryId,                 // UUID
+    AuditEventType eventType,
+    String docId,                   // null for system-level events
+    String userId,                  // user identity or "system"
+    String userEmail,
+    Instant timestamp,              // UTC, millisecond precision
+    String clientIp,
+    AuditOutcome outcome,           // SUCCESS | FAILURE | DENIED
+    Map<String, Object> details     // Event-specific fields
+) {}
+
+public enum AuditEventType {
+    DOCUMENT_UPLOAD,
+    DOCUMENT_DOWNLOAD,
+    DOCUMENT_EDIT_SESSION_OPEN,
+    DOCUMENT_EDIT_SESSION_CLOSE,
+    DOCUMENT_EDIT_SESSION_CHECKIN,
+    DOCUMENT_SYNC_SUCCESS,
+    DOCUMENT_SYNC_FAILURE,
+    DOCUMENT_SYNC_NO_CHANGE,
+    DOCUMENT_DELETE,
+    DOCUMENT_SEARCH,
+    PERMISSION_GRANT,
+    PERMISSION_REVOKE,
+    PERMISSION_DENIED,
+    WEBHOOK_VALIDATION_MISMATCH,
+    WEBHOOK_CHANGE_LOG_FETCH_FAILED,
+    SUBSCRIPTION_REGISTERED,
+    SUBSCRIPTION_RENEWED,
+    SUBSCRIPTION_RE_REGISTERED,
+    SUBSCRIPTION_REGISTRATION_FAILED,
+    SENSITIVITY_LABEL_CHANGED,
+    VERSION_HISTORY_LIST
 }
 
-type AuditEventType =
-  | 'document.upload'
-  | 'document.download'
-  | 'document.edit_session.open'
-  | 'document.edit_session.close'
-  | 'document.sync.success'
-  | 'document.sync.failure'
-  | 'document.sync.no_change'
-  | 'document.delete'
-  | 'document.search'
-  | 'permission.grant'
-  | 'permission.revoke'
-  | 'permission.denied'
-  | 'webhook.validation_mismatch'
-  | 'webhook.change_log_fetch_failed'
-  | 'subscription.registered'
-  | 'subscription.renewed'
-  | 'subscription.re_registered'
-  | 'subscription.registration_failed'
-  | 'sensitivity_label.changed'
-  | 'version_history.list';
-```
+public enum AuditOutcome { SUCCESS, FAILURE, DENIED }
+`
 
-### Debounce_Timer (DynamoDB TTL / Redis key)
+### DebounceTimer
 
-```typescript
-interface DebounceTimer {
-  doc_id: string;
-  fires_at_epoch_seconds: number; // DynamoDB TTL attribute; or Redis EXPIREAT key
-  library_id: string;
-  subscription_id: string;
-}
-```
-
----
-
+`java
+public record DebounceTimer(
+    String docId,
+    long firesAtEpochSeconds,  // DynamoDB TTL attribute; or Redisson delayed queue expiry
+    String libraryId,
+    String subscriptionId
+) {}
+`
 ## API Design
 
 ### Authentication Endpoints
@@ -498,37 +548,39 @@ GET  /compliance/data-residency → { adapters: [{ name, endpoint, data_residenc
 
 ### DocumentListItem Shape
 
-```typescript
-interface DocumentListItem {
-  doc_id: string;
-  filename: string;
-  file_size_bytes: number;
-  last_modified_at: string;
-  last_modified_by_display_name: string;
-  current_version: number;
-  effective_permission: 'view' | 'edit' | 'owner';
-  sensitivity_label: SensitivityLabel;
-  wopi_view_url?: string;          // present for Office-compatible files
-}
-```
-
+```java
+public record DocumentListItem(
+    String docId,
+    String filename,
+    long fileSizeBytes,
+    Instant lastModifiedAt,
+    String lastModifiedByDisplayName,
+    int currentVersion,
+    PermissionLevel effectivePermission,  // VIEW | EDIT | OWNER
+    SensitivityLabel sensitivityLabel,
+    String wopiViewUrl                    // null for non-Office files
+) {}```
 ---
 
 ## Technology Stack
 
 | Layer | Cloud Global | Sovereign / On-Prem | Local Dev | Rationale |
 |---|---|---|---|---|
-| **Runtime** | Node.js 22 on Lambda / ECS | Node.js 22 on K8s | Node.js 22 (Docker) | Single codebase; async I/O suits streaming large files |
-| **API framework** | Fastify | Fastify | Fastify | Low overhead; native streaming; schema validation |
-| **Auth (IdP)** | Microsoft Entra ID | Keycloak / ADFS | Keycloak (dev mode) | OIDC-standard; PKCE required by requirements |
-| **SharePoint** | Graph API (global) | Graph (21Vianet) / SP REST | SP REST mock | Adapter pattern isolates API differences |
-| **Object Storage** | AWS S3 | MinIO / Alibaba OSS | MinIO | S3-compatible API across all drivers |
-| **Metadata Store** | DynamoDB | PostgreSQL / SQL Server | PostgreSQL | Adapter pattern; DynamoDB for scale, PG for sovereign |
-| **Debounce Timer** | EventBridge Scheduler | BullMQ (Redis) on K8s | BullMQ (Redis) | DynamoDB TTL + EventBridge for cloud; Redis for on-prem |
-| **IaC (cloud)** | AWS CDK (TypeScript) | — | — | Type-safe; co-located with app code |
+| **Language / Runtime** | Java 21 (LTS) on ECS Fargate | Java 21 on K8s | Java 21 (Docker) | Virtual threads (Project Loom); non-blocking I/O without reactive complexity; single codebase across all topologies |
+| **Build tool** | Gradle 8 (Kotlin DSL) | Gradle 8 | Gradle 8 | Faster incremental builds than Maven; type-safe DSL |
+| **API framework** | Spring Boot 3.3 (Spring MVC + virtual threads) | Spring Boot 3.3 | Spring Boot 3.3 | Industry standard; streaming via StreamingResponseBody; @ConditionalOnProperty driver selection |
+| **Auth (IdP)** | Microsoft Entra ID | Keycloak / ADFS | **Dex** (static password connector) | OIDC-standard; PKCE required; Dex is a single-binary OIDC provider — no DB, <2s startup, no Entra ID setup needed for local dev |
+| **Auth library** | Spring Security 6 + spring-security-oauth2-resource-server | Spring Security 6 | Spring Security 6 | JWT validation, PKCE flow, multi-provider via Spring @Profile |
+| **SharePoint** | Microsoft Graph SDK for Java v6 (global) | Graph SDK (21Vianet) / SP REST via RestClient | SP REST mock | Official MS SDK; adapter pattern isolates API differences |
+| **Object Storage** | AWS SDK for Java v2 (S3AsyncClient) | MinIO Java SDK / Alibaba OSS Java SDK | MinIO Java SDK | S3-compatible streaming; async client for non-blocking uploads |
+| **Metadata Store** | AWS SDK for Java v2 (DynamoDbAsyncClient) | Spring Data JPA + PostgreSQL / SQL Server | Spring Data JPA + PostgreSQL | Adapter pattern; DynamoDB for cloud scale, JPA for sovereign |
+| **Debounce Timer** | EventBridge Scheduler + DynamoDB TTL | Redisson (Redis delayed queue) on K8s | Redisson (Redis) | EventBridge for cloud; Redisson replaces BullMQ; Java-native Redis client |
+| **IaC (cloud)** | AWS CDK for Java | — | — | Type-safe Java CDK constructs; co-located with app module |
 | **IaC (sovereign)** | — | Helm + Docker Compose | Docker Compose | Kubernetes-native for sovereign; Compose for dev |
-| **Observability** | CloudWatch + X-Ray | Prometheus + Grafana | stdout JSON | Prometheus /metrics endpoint on all topologies |
-| **PBT framework** | fast-check (TypeScript) | fast-check | fast-check | Mature; integrates with Jest/Vitest; arbitrary generators |
+| **Observability** | Micrometer + CloudWatch / X-Ray | Micrometer + Prometheus + Grafana | Micrometer to stdout | Native Spring Boot ActuatorMetrics; same /metrics endpoint across all topologies |
+| **Logging** | Logback + logstash-logback-encoder (JSON) | Logback JSON | Logback JSON to stdout | Structured JSON logs; MDC for X-Request-ID propagation |
+| **PBT framework** | jqwik 1.8 (JUnit 5) | jqwik | jqwik | Java-native PBT; @Property + @ForAll + Arbitraries; integrates with JUnit 5 |
+| **Test framework** | JUnit 5 + Mockito + Testcontainers | JUnit 5 + Mockito + Testcontainers | JUnit 5 + Mockito + Testcontainers | Testcontainers spins up PostgreSQL, MinIO, Keycloak for integration tests |
 
 ---
 
@@ -567,6 +619,47 @@ The `clientState` field sent in subscription registration is a 32-byte cryptogra
 
 **Local Dev:** Audit entries are written to stdout as structured JSON (Requirement 15.6). No WORM enforcement.
 
+### Dex Configuration for Local Development
+
+Dex runs as a Docker Compose service and is configured via a committed `dex-config.yaml` file. Three named test users are pre-defined to cover all permission levels and enable immediate multi-user co-authoring testing without any manual setup:
+
+```yaml
+# dex-config.yaml (committed to repo — local dev only, no real credentials)
+issuer: http://dex:5556/dex
+
+storage:
+  type: memory
+
+web:
+  http: 0.0.0.0:5556
+
+staticClients:
+  - id: document-share-app
+    redirectURIs:
+      - 'http://localhost:8080/auth/callback'
+    name: 'Document Share App (local)'
+    secret: local-dev-secret
+
+enablePasswordDB: true
+staticPasswords:
+  - email: 'alice@example.com'
+    hash: '$2a$10$2b2cU8CPhOTaGrs1HRQuAueS7JTT5ZHsHSzYRoutBpxIa6grF6.Ra'  # password: password
+    username: 'alice'
+    userID: 'user-alice'
+    # Role in sample data: owner — can edit, share, and delete
+  - email: 'bob@example.com'
+    hash: '$2a$10$2b2cU8CPhOTaGrs1HRQuAueS7JTT5ZHsHSzYRoutBpxIa6grF6.Ra'  # password: password
+    username: 'bob'
+    userID: 'user-bob'
+    # Role in sample data: edit — can co-author; primary co-authoring partner for alice
+  - email: 'charlie@example.com'
+    hash: '$2a$10$2b2cU8CPhOTaGrs1HRQuAueS7JTT5ZHsHSzYRoutBpxIa6grF6.Ra'  # password: password
+    username: 'charlie'
+    userID: 'user-charlie'
+    # Role in sample data: view — read-only; useful for testing permission enforcement
+```
+
+Spring Security points to `http://dex:5556/dex` as the OIDC issuer URI via the `OIDC_ISSUER_URI` environment variable. No Entra ID tenant, no Keycloak realm import, no external account required.
 ### Data Residency Guard (Sovereign)
 
 The `GraphChinaDriver` and all sovereign auth drivers include a URL guard that checks every outbound request URL against a blocklist of global Microsoft endpoints (`graph.microsoft.com`, `login.microsoftonline.com`, `*.sharepoint.com`). If matched, the call is rejected with an error and logged — no request is made. This implements Requirement 17.4 and 20.4.
@@ -591,7 +684,7 @@ Sync_Service.syncDocument(docId):
   4. content_stream = SharePointAdapter.downloadItem(...)
      ├── On 3× failure → audit download-failed, abort (no partial S3 write)
   5. new_version = stored.current_version + 1
-     s3_key = `docs/${docId}/v${new_version}/${stored.filename}`
+     s3_key = "docs/" + docId + "/v" + new_version + "/" + stored.filename
   6. StorageAdapter.putObject(s3_key, content_stream, { spo_etag, version, doc_id })
      ├── Retry 3× with 30s/60s/120s back-off
      ├── On exhaustion → audit sync-failed, emit alert, abort
@@ -609,9 +702,11 @@ Sync_Service.syncDocument(docId):
 
 ### Debounce Timer Implementation
 
+> **Note:** The debounce timer is used only when Check-Out enforcement is not enabled on the Document_Library. When `ItemCheckedIn` webhooks are the trigger (Path A), the timer is not involved.
+
 **Cloud Global:** Each webhook reset writes a DynamoDB item with TTL = now + 180 seconds. An EventBridge Scheduler rule fires for every DynamoDB TTL expiry event targeting the `Sync_Service` Lambda. Because DynamoDB TTL fires within minutes of the configured epoch time, the actual debounce window is "3 minutes or slightly more."
 
-**Sovereign / On-Prem:** BullMQ (backed by Redis) is used. Each `setDebounceTimer` call does `queue.add('sync', { docId }, { delay: 180_000, jobId: docId, removeOnComplete: true })`. A subsequent call with the same `jobId` replaces the existing job (BullMQ `repeat: false` + `jobId` uniqueness), implementing the reset.
+**Sovereign / On-Prem:** Redisson (Java Redis client) is used. Each `setDebounceTimer` call schedules a delayed entry in a Redisson RDelayedQueue<String>: `delayedQueue.offer(docId, 180, TimeUnit.SECONDS)`. A reset cancels any pending entry for the same `docId` and re-schedules with a fresh 180-second delay. A dedicated consumer thread drains the queue and invokes the Sync_Service.
 
 ---
 
@@ -680,11 +775,11 @@ The testing approach is dual: unit/example-based tests for specific scenarios an
 
 ### Property-Based Testing
 
-The platform uses **fast-check** (TypeScript) for property-based testing. Each property test is configured to run a minimum of **100 iterations**. Tests are tagged with a comment referencing the design property they validate, using the format:
+The platform uses **jqwik 1.8** (JUnit 5) for property-based testing. Each property test is annotated with @Property(tries = 100) (minimum 100 iterations). Tests are tagged with a comment referencing the design property they validate, using the format:
 
-```
+`java
 // Feature: document-share-app, Property N: <property text>
-```
+`
 
 Property-based tests are appropriate for this feature because it contains:
 - A round-trip serialisation requirement (Req 22) with a wide, typed input space
@@ -693,29 +788,91 @@ Property-based tests are appropriate for this feature because it contains:
 
 ### Unit / Example-Based Tests
 
-Unit tests cover:
+Unit tests (JUnit 5 + Mockito) cover:
 - Specific HTTP status code responses (400, 403, 404, 409, 500, 502) for concrete inputs
 - Error handling branches (retry exhaustion, partial failure rollback)
 - Sensitivity label enforcement rules
 - Confirmation token issuance and validation
 - Rate limiting sliding window logic
-- clientState HMAC validation
+- clientState HMAC validation (MessageDigest constant-time comparison)
 
 ### Integration Tests
 
-Integration tests (2–3 representative examples) cover:
-- WOPI URL generation and redirect behaviour (Req 5 — 100 iterations add no value)
+Integration tests use **Testcontainers** to spin up real PostgreSQL and MinIO containers (Dex runs as a plain Docker image in the compose stack; it does not need Testcontainers):
+- WOPI URL generation and redirect behaviour (Req 5 — 100 iterations add no value over 2–3 representative scenarios)
 - Download streaming for specific version numbers (Req 4)
 - Data residency endpoint blocking (Req 20) — 1 unit test per blocked domain + smoke test
+
+#### Multi-User Co-Authoring Integration Tests (Req 5)
+
+Three patterns are available depending on what layer is under test:
+
+**Pattern A — Manual (developer workflow, not automated):**
+Open two browser sessions as different identities using browser profiles or an incognito window. Log in as `alice` in one and `bob` in the other via the Dex login screen (password: `password`). Both open the same document and exercise the WOPI co-authoring session. No code required; immediate after `docker compose up`.
+
+**Pattern B — Playwright multi-context (automated, full WOPI session):**
+Uses Playwright's `BrowserContext` isolation — each context has independent cookies and session state, so two contexts can be logged in as different users simultaneously.
+
+```java
+// JUnit 5 + Playwright Java — tests the full WOPI co-authoring session end-to-end
+@Test
+void aliceAndBobCoAuthorSameDocument() {
+    try (Playwright playwright = Playwright.create()) {
+        Browser browser = playwright.chromium().launch();
+
+        // Alice opens doc for editing
+        BrowserContext aliceCtx = browser.newContext();
+        Page alicePage = aliceCtx.newPage();
+        loginAsDexUser(alicePage, "alice@example.com", "password");
+        alicePage.navigate("http://localhost:8080/documents/" + DOC_ID + "/edit");
+
+        // Bob opens the same doc — WOPI shared lock activates
+        BrowserContext bobCtx = browser.newContext();
+        Page bobPage = bobCtx.newPage();
+        loginAsDexUser(bobPage, "bob@example.com", "password");
+        bobPage.navigate("http://localhost:8080/documents/" + DOC_ID + "/edit");
+
+        // Assert co-authoring indicators visible in both sessions
+        alicePage.waitForSelector(".coauth-indicator");
+        bobPage.waitForSelector(".coauth-indicator");
+    }
+}
+```
+
+**Pattern C — Token injection (automated, backend sync logic only):**
+Mints JWTs programmatically and submits concurrent requests against the API. No browser or Dex OIDC flow involved. Best for testing the ETag idempotence property (Property 2) under concurrent load.
+
+```java
+// Spring Boot MockMvc test — concurrent sync from two identities
+@Test
+void concurrentSyncProducesExactlyOneVersionBump() throws Exception {
+    String aliceToken = mintTestJwt("user-alice", "alice@example.com");
+    String bobToken   = mintTestJwt("user-bob",   "bob@example.com");
+
+    CountDownLatch start = new CountDownLatch(1);
+    CompletableFuture<Void> aliceSync = CompletableFuture.runAsync(() -> {
+        start.await();
+        mockMvc.perform(post("/internal/sync/" + DOC_ID)
+            .header("Authorization", "Bearer " + aliceToken));
+    });
+    CompletableFuture<Void> bobSync = CompletableFuture.runAsync(() -> {
+        start.await();
+        mockMvc.perform(post("/internal/sync/" + DOC_ID)
+            .header("Authorization", "Bearer " + bobToken));
+    });
+
+    start.countDown();  // release both at the same time
+    CompletableFuture.allOf(aliceSync, bobSync).join();
+
+    assertThat(metadataStore.getDocument(DOC_ID).currentVersion()).isEqualTo(INITIAL_VERSION + 1);
+}
+```
 
 ### Smoke Tests
 
 - Local Docker Compose startup and health check passes within 60 seconds (Req 15.2)
-- All adapter health probes return `ok` in a known-good environment
+- All adapter health probes return ok in a known-good environment
 
-
-
----
 
 ## Correctness Properties
 
@@ -763,36 +920,42 @@ The following properties were derived from the acceptance criteria after prework
 
 ### PBT Configuration
 
-```typescript
+`java
 // Feature: document-share-app, Property 1: subscription renewal idempotence
-test.prop([fc.array(libraryArbitrary(), { minLength: 1, maxLength: 20 }), fc.integer({ min: 2, max: 10 })])(
-  'running renewal job N times produces same subscriptions as once',
-  async (libraries, n) => { /* ... */ }
-);
+@Property(tries = 100)
+void runningRenewalJobNTimesProducesSameSubscriptionsAsOnce(
+        @ForAll @Size(min = 1, max = 20) List<@From("libraries") LibraryRef> libraries,
+        @ForAll @IntRange(min = 2, max = 10) int n) {
+    // ... assert exactly one active subscription per library after N runs
+}
 
 // Feature: document-share-app, Property 2: ETag-based sync idempotence and uniqueness
-test.prop([documentRecordArbitrary(), fc.array(etagArbitrary(), { minLength: 1, maxLength: 10 })])(
-  'sync trigger sequence produces version count == distinct ETag count',
-  async (doc, etags) => { /* ... */ }
-);
+@Property(tries = 100)
+void syncTriggerSequenceProducesVersionCountEqualsDistinctEtagCount(
+        @ForAll @From("documentRecords") DocumentRecord doc,
+        @ForAll @Size(min = 1, max = 10) List<@From("etags") String> etags) {
+    // ... assert version count == number of distinct ETags in trigger sequence
+}
 
 // Feature: document-share-app, Property 3: metadata serialisation round-trip
-test.prop([documentRecordArbitrary()])(
-  'deserialise(serialise(record)) equals record',
-  async (record) => { /* ... */ }
-);
+@Property(tries = 100)
+void deserialiseSerialiseRoundTrip(
+        @ForAll @From("documentRecords") DocumentRecord record) {
+    DocumentRecord roundTripped = deserialise(serialise(record));
+    assertThat(roundTripped).isEqualTo(record);
+}
 
 // Feature: document-share-app, Property 4: API-level metadata round-trip
-test.prop([uploadPayloadArbitrary()])(
-  'GET response fields match POST payload fields',
-  async (payload) => { /* ... */ }
-);
-```
+@Property(tries = 100)
+void getResponseFieldsMatchPostPayloadFields(
+        @ForAll @From("uploadPayloads") UploadPayload payload) {
+    // ... POST upload, GET document, assert all fields equal
+}
+`
 
-Each test is configured with `numRuns: 100` (minimum). The `documentRecordArbitrary()` generator MUST produce records that include:
-- Timestamps with millisecond-level precision (e.g., `"2026-04-15T08:30:00.123Z"`)
-- Filenames with characters from U+4E00–U+9FFF (e.g., `"报告_2026.docx"`)
-- Version numbers up to `Number.MAX_SAFE_INTEGER`
-- S3 keys with multiple `/` separators (e.g., `"docs/uuid/v42/folder/report.docx"`)
-- All four `SensitivityLabel` values
-
+Each test runs a minimum of 100 iterations (@Property(tries = 100)). The @Provide("documentRecords") arbitrary MUST generate records that include:
+- Instant timestamps with millisecond precision (e.g., Instant.parse("2026-04-15T08:30:00.123Z"))
+- Filenames with characters from the Unicode CJK Unified Ideographs block (U+4E00–U+9FFF) (e.g., "报告_2026.docx")
+- Version numbers up to Integer.MAX_VALUE
+- S3 keys with multiple / separators (e.g., "docs/uuid/v42/folder/report.docx")
+- All four SensitivityLabel enum values
